@@ -1,243 +1,191 @@
 import fetch from 'node-fetch';
 import { OpenAI } from 'openai';
 import { vectorStore } from './lib/vector-store.js';
-import fs from 'fs/promises';
+import { config } from './config.js';
+import { initializeDatabase, loadRepliedIds as loadIdsFromDb, addRepliedId } from './lib/database.js';
 
-// --- Helper Functions & Interfaces ---
-function getEnv(key: string): string {
-  const value = process.env[key];
-  if (!value) throw new Error(`Missing required environment variable: ${key}`);
-  return value;
-}
+interface DiscoursePost { id: number; topic_id: number; username: string; cooked: string; raw: string; }
+interface DiscourseTopicResponse { post_stream: { posts: DiscoursePost[] }; title: string; }
+interface DiscoursePostsResponse { latest_posts: DiscoursePost[] }
 
-interface DiscoursePostsResponse {
-  latest_posts: any[];
-}
-
-interface DiscourseTopicResponse {
-  post_stream: {
-    posts: any[];
-  };
-  title: string;
-}
-
-interface DiscoursePostCreationResponse {
-  id: number;
-}
-
-// --- Configuration ---
-const DISCOURSE_API_KEY = getEnv('DISCOURSE_API_KEY');
-const DISCOURSE_API_USERNAME = getEnv('DISCOURSE_API_USERNAME');
-const DISCOURSE_BASE_URL = getEnv('DISCOURSE_BASE_URL');
-const REPLIED_POSTS_DB_PATH = './data/replied_posts.json';
-
-const thinkingMessages = [
-    '_Thinking..._',
-    '_Processing your request..._',
-    '_One moment, looking that up..._',
-    '_Compiling an answer..._'
-];
-
-const negativeKeywords = ['no', 'nope', 'nah', 'not really', 'not helpful', "didn't get it", 'not at all'];
-const positiveKeywords = ['yes', 'yep', 'thanks', 'thank you', 'helpful', 'perfect', 'super helpful', 'sure was'];
-
-const openai = new OpenAI({
-  apiKey: getEnv('OPENAI_API_KEY')
-});
-
-// --- State Management ---
-type FeedbackState = 'awaiting_initial_feedback' | 'awaiting_escalation_confirmation';
-const awaitingFeedback = new Map<number, { state: FeedbackState }>();
+// API Clients
+const openai = new OpenAI({ apiKey: config.openai.apiKey });
 let repliedPostIds = new Set<number>();
 
-async function loadRepliedIds(): Promise<void> {
-  try {
-    const data = await fs.readFile(REPLIED_POSTS_DB_PATH, 'utf-8');
-    repliedPostIds = new Set(JSON.parse(data));
-    console.log(`✅ Loaded ${repliedPostIds.size} replied post IDs from file.`);
-  } catch (error) {
-    if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT') {
-      console.log('No replied posts database found. Starting fresh.');
-      repliedPostIds = new Set();
-    } else { throw error; }
-  }
+type FeedbackState = 'awaiting_initial_feedback' | 'awaiting_escalation_confirmation';
+const awaitingFeedback = new Map<number, { state: FeedbackState }>();
+const positiveKeywords = ['yes', 'yep', 'thanks', 'thank you', 'helpful', 'perfect', 'super helpful', 'sure was', 'that worked'];
+const negativeKeywords = ['no', 'nope', 'nah', 'not really', 'not helpful', "didn't work", 'not at all'];
+
+const log = (message: string) => console.log(`[${config.bot.instanceId}] ${message}`);
+const botFooter = () => `\n\n---\n> Bot v${config.bot.version}`;
+
+function markPostAsReplied(postId: number) {
+  repliedPostIds.add(postId);
+  addRepliedId(postId);
 }
 
-async function saveRepliedIds(): Promise<void> {
-  await fs.mkdir('./data', { recursive: true });
-  const data = JSON.stringify(Array.from(repliedPostIds));
-  await fs.writeFile(REPLIED_POSTS_DB_PATH, data);
-}
-
-async function fetchTopicHistory(topic_id: number): Promise<DiscourseTopicResponse | null> {
-  const res = await fetch(`${DISCOURSE_BASE_URL}/t/${topic_id}.json`, {
-    headers: { 'Api-Key': DISCOURSE_API_KEY, 'Api-Username': DISCOURSE_API_USERNAME },
-  });
-  if (!res.ok) {
-    console.error(`Failed to fetch topic history for topic ${topic_id}. Status: ${res.status}`);
-    return null;
-  }
-  return await res.json() as DiscourseTopicResponse;
-}
-
-async function postReply(topic_id: number, raw: string): Promise<number> {
-  const res = await fetch(`${DISCOURSE_BASE_URL}/posts.json`, {
-    method: 'POST',
-    headers: { 'Api-Key': DISCOURSE_API_KEY, 'Api-Username': DISCOURSE_API_USERNAME, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ topic_id, raw }),
-  });
-
+async function apiRequest(endpoint: string, options: any = {}): Promise<any> {
+  const url = `${config.discourse.baseUrl}${endpoint}`;
+  const headers = { 'Api-Key': config.discourse.apiKey, 'Api-Username': config.discourse.apiUsername, 'Content-Type': 'application/json', ...options.headers };
+  const res = await fetch(url, { ...options, headers });
   if (!res.ok) {
     const errorBody = await res.text();
-    console.error(`❌ Failed to post reply. Status: ${res.status}`);
-    console.error('❌ Discourse Error Body:', errorBody);
-    throw new Error('Failed to post reply to Discourse.');
+    throw new Error(`Discourse API Error on ${endpoint}: ${res.status} - ${errorBody}`);
   }
-  const jsonResponse = await res.json() as DiscoursePostCreationResponse;
-  return jsonResponse.id;
+  return res.json();
 }
 
-async function editPost(post_id: number, new_content: string): Promise<void> {
-  const res = await fetch(`${DISCOURSE_BASE_URL}/posts/${post_id}.json`, {
-    method: 'PUT',
-    headers: { 'Api-Key': DISCOURSE_API_KEY, 'Api-Username': DISCOURSE_API_USERNAME, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ post: { raw: new_content } }),
-  });
+const fetchLatestPosts = (): Promise<DiscoursePostsResponse> => apiRequest('/posts.json');
+const fetchTopicHistory = (id: number): Promise<DiscourseTopicResponse> => apiRequest(`/t/${id}.json`);
+const postReply = (id: number, raw: string, includeFooter: boolean = true): Promise<{ id: number }> => apiRequest('/posts.json', { method: 'POST', body: JSON.stringify({ topic_id: id, raw: raw + (includeFooter ? botFooter() : '') }) });
+const editPost = (id: number, raw: string): Promise<void> => apiRequest(`/posts/${id}.json`, { method: 'PUT', body: JSON.stringify({ post: { raw: raw + botFooter() } }) });
+const sendPrivateMessage = (title: string, raw: string, group: string): Promise<void> => apiRequest('/posts.json', { method: 'POST', body: JSON.stringify({ title, raw, archetype: 'private_message', target_group_names: [group] }) });
 
-   if (!res.ok) {
-    const errorBody = await res.text();
-    console.error(`❌ Failed to edit post ${post_id}. Status: ${res.status}`);
-    console.error('❌ Discourse Error Body:', errorBody);
-    throw new Error('Failed to edit post.');
-  }
+type UserIntent = 'question' | 'bug_report' | 'escalation_request' | 'positive_feedback' | 'other';
+
+async function determineUserIntent(postContent: string): Promise<UserIntent> {
+    const prompt = config.prompts.intentClassification(postContent);
+    const completion = await openai.chat.completions.create({ model: config.openai.model, messages: [{ role: 'user', content: prompt }], max_tokens: 15, temperature: 0 });
+    const rawIntent = completion.choices[0].message.content?.trim().toLowerCase() || 'other';
+    const cleanIntent = rawIntent.split(/[\s:]+/)[0].replace(/"/g, '');
+    const validIntents: UserIntent[] = ['question', 'bug_report', 'escalation_request', 'positive_feedback', 'other'];
+    if ((validIntents as string[]).includes(cleanIntent)) { return cleanIntent as UserIntent; }
+    return 'other';
+}
+
+async function handleQuestion(post: DiscoursePost, topicData: DiscourseTopicResponse) {
+    const startTime = Date.now();
+    log(`🤖 Handling post ${post.id} as a question.`);
+    markPostAsReplied(post.id);
+
+    const randomThinkingMessage = config.bot.thinkingMessages[Math.floor(Math.random() * config.bot.thinkingMessages.length)];
+    const { id: thinkingPostId } = await postReply(post.topic_id, randomThinkingMessage, false);
+    if(thinkingPostId) markPostAsReplied(thinkingPostId);
+
+    const latestUserPostContent = post.raw.replace(/<[^>]*>?/gm, '').trim();
+    const similarDocs = await vectorStore.similaritySearch(latestUserPostContent, 3);
+    const context = similarDocs.map(doc => doc.pageContent).join('\n---\n');
+
+    const recentHistory = topicData.post_stream.posts.slice(-10);
+    const messages: OpenAI.Chat.ChatCompletionMessageParam[] = recentHistory
+        .filter(p => p.id !== thinkingPostId)
+        .map(p => ({
+            role: p.username === config.discourse.apiUsername ? 'assistant' : 'user',
+            content: `User '${p.username}' said: ${p.cooked.replace(/<[^>]*>?/gm, '').trim()}`,
+        }));
+
+    const completion = await openai.chat.completions.create({ model: config.openai.model, messages: [{ role: 'system', content: config.prompts.mainSystem(topicData.title, context) }, ...messages] });
+    let aiReply = completion.choices[0].message.content;
+
+    if (aiReply && thinkingPostId) {
+        aiReply += "\n\n*Was this helpful? You can reply with 'Yes' or 'No' to let me know.*";
+        await editPost(thinkingPostId, aiReply);
+        
+        awaitingFeedback.set(post.topic_id, { state: 'awaiting_initial_feedback' });
+        log(`✅ Edited post ${thinkingPostId}. Now awaiting feedback for topic ${post.topic_id}.`);
+    }
+}
+
+async function handleFeedbackReply(post: DiscoursePost) {
+    log(`💬 Handling post ${post.id} as a feedback reply.`);
+    markPostAsReplied(post.id);
+
+    const feedbackSession = awaitingFeedback.get(post.topic_id);
+    if (!feedbackSession) return;
+
+    const userReply = post.raw.trim();
+    const isPositive = positiveKeywords.some(keyword => new RegExp(`^\\s*${keyword}\\b`, 'i').test(userReply) && userReply.length < 30);
+    const isNegative = negativeKeywords.some(keyword => new RegExp(`^\\s*${keyword}\\b`, 'i').test(userReply) && userReply.length < 30);
+
+    if (feedbackSession.state === 'awaiting_initial_feedback') {
+        if (isPositive) {
+            const { id: replyId } = await postReply(post.topic_id, "Thanks, I'm glad I could help!");
+            if (replyId) markPostAsReplied(replyId);
+            awaitingFeedback.delete(post.topic_id);
+        } else if (isNegative) {
+            const { id: replyId } = await postReply(post.topic_id, "I'm sorry to hear that. Do you want me to raise a ticket for the support team?");
+            if (replyId) markPostAsReplied(replyId);
+            awaitingFeedback.set(post.topic_id, { state: 'awaiting_escalation_confirmation' });
+        } else {
+            log(`- User reply in topic ${post.topic_id} was not a clear 'Yes' or 'No'. Treating as a new question.`);
+            awaitingFeedback.delete(post.topic_id);
+            await processPost(post);
+        }
+    } else if (feedbackSession.state === 'awaiting_escalation_confirmation') {
+        awaitingFeedback.delete(post.topic_id);
+        if (isPositive) {
+            const { id: replyId } = await postReply(post.topic_id, "Okay, I have created a ticket for the support team. They will review this conversation and get back to you here shortly.");
+            if (replyId) markPostAsReplied(replyId);
+            log(`- 🚨 User confirmed escalation for topic ${post.topic_id}. This is a placeholder.`);
+        } else if (isNegative) {
+            const { id: replyId } = await postReply(post.topic_id, "Okay, I will not escalate the situation. If you have another question, feel free to ask.");
+            if (replyId) markPostAsReplied(replyId);
+        }
+    }
+}
+
+async function processPost(post: DiscoursePost) {
+    const intent = await determineUserIntent(post.raw);
+    log(`- 🧠 Intent for post ${post.id} classified as: ${intent}`);
+    
+    const topicData = await fetchTopicHistory(post.topic_id);
+    if (!topicData) {
+        log(`- ⚠️ Could not fetch topic data for post ${post.id}. Skipping.`);
+        markPostAsReplied(post.id);
+        return;
+    }
+
+    if (intent === 'question') {
+        await handleQuestion(post, topicData);
+    } else {
+        markPostAsReplied(post.id);
+        log(`- 💤 Ignoring post ${post.id} with non-question intent: '${intent}'. Added to memory.`); 
+    }
 }
 
 const spinner = ['   ', '.  ', '.. ', '...'];
 let spinnerIndex = 0;
 
 async function runBot() {
-  process.stdout.write(`Waiting${spinner[spinnerIndex]}\r`);
+  process.stdout.write(`[${config.bot.instanceId}] Waiting${spinner[spinnerIndex]}\r`);
   spinnerIndex = (spinnerIndex + 1) % spinner.length;
 
-  try {
-    const res = await fetch(`${DISCOURSE_BASE_URL}/posts.json`, {
-      headers: { 'Api-Key': DISCOURSE_API_KEY, 'Api-Username': DISCOURSE_API_USERNAME },
-    });
-    const response = await res.json() as DiscoursePostsResponse;
-    if (!response.latest_posts) return;
+  const { latest_posts } = await fetchLatestPosts();
+  if (!latest_posts) return;
 
-    for (const post of response.latest_posts) {
-      if (repliedPostIds.has(post.id) || post.username === DISCOURSE_API_USERNAME) {
-        continue;
-      }
-
-      let isNewPost = true;
-      if (awaitingFeedback.has(post.topic_id)) {
-        const feedbackInfo = awaitingFeedback.get(post.topic_id)!;
-        const userReply = post.raw.trim().toLowerCase();
-
-        if (feedbackInfo.state === 'awaiting_initial_feedback') {
-          const isPositive = positiveKeywords.some(keyword => userReply.includes(keyword));
-          const isNegative = negativeKeywords.some(keyword => userReply.includes(keyword));
-
-          if (isPositive || isNegative) {
-            isNewPost = false;
-            repliedPostIds.add(post.id);
-            await saveRepliedIds();
-            awaitingFeedback.delete(post.topic_id);
-            if (isPositive) {
-                await postReply(post.topic_id, "Great! Glad I could help.");
-            } else {
-                awaitingFeedback.set(post.topic_id, { state: 'awaiting_escalation_confirmation' });
-                await postReply(post.topic_id, "I'm sorry to hear that. Would you like me to create a private ticket for our support team?");
-            }
-          } else {
-            awaitingFeedback.delete(post.topic_id);
-            console.log(`\n💬 User posted a follow-up in topic ${post.topic_id}. Switching out of feedback mode.`);
-          }
-        } else if (feedbackInfo.state === 'awaiting_escalation_confirmation') {
-          isNewPost = false;
-          repliedPostIds.add(post.id);
-          await saveRepliedIds();
-          awaitingFeedback.delete(post.topic_id);
-          if (userReply.includes('yes')) {
-            await postReply(post.topic_id, "Okay, your request has been forwarded to the support team. They will review this topic and get back to you here.");
-          } else {
-            await postReply(post.topic_id, "Okay, I won't escalate this for now. If you have any other questions, feel free to ask.");
-          }
-        }
-      }
-
-      if (isNewPost) {
-        process.stdout.write('\n');
-        const startTime = Date.now();
-        console.log(`🤖 Responding to new post ID ${post.id} in topic ${post.topic_id}`);
-        
-        repliedPostIds.add(post.id);
-        await saveRepliedIds();
-
-        const randomThinkingMessage = thinkingMessages[Math.floor(Math.random() * thinkingMessages.length)];
-        const thinkingPostId = await postReply(post.topic_id, randomThinkingMessage);
-        console.log(`💬 Posted '${randomThinkingMessage}' message with ID ${thinkingPostId}`);
-
-        const topicData = await fetchTopicHistory(post.topic_id);
-        const recentHistory = topicData ? topicData.post_stream.posts.slice(-10) : [];
-        
-        const messages = recentHistory
-          .filter(p => p.cooked && p.id !== thinkingPostId)
-          .map(p => {
-            const plainText = p.cooked.replace(/<[^>]*>?/gm, '');
-            return {
-              role: p.username === DISCOURSE_API_USERNAME ? 'assistant' as const : 'user' as const,
-              content: `The user '${p.username}' said: ${plainText.trim()}`,
-            };
-        });
-        
-        const latestUserContent = messages.length > 0 ? messages[messages.length - 1].content : '';
-        const similarDocs = await vectorStore.similaritySearch(latestUserContent, 3);
-        const context = similarDocs.map(doc => doc.pageContent).join('\n---\n');
-
-        const completion = await openai.chat.completions.create({
-          model: 'gpt-4o',
-          messages: [
-            {
-              role: 'system',
-              content: `You are an expert AI assistant for the "${topicData?.title}" topic on a community forum. 
-              You were created by Zaid Mallik.
-              Your primary purpose is to answer user questions based on the provided conversation history and an internal knowledge base.\n\n**Instructions:**\n1. 
-              Carefully analyze the **entire conversation transcript** to understand the user's full request.\n2. Prioritize using information from the **KNOWLEDGE BASE** if it is provided and relevant.
-              \n3. Answer the user's most recent post directly and accurately.\n4. Do NOT provide generic, off-topic answers.\n\n--- KNOWLEDGE BASE ---\n${context}`
-            },
-            ...messages
-          ]
-        });
-        const aiReply = completion.choices[0].message.content;
-
-        if (aiReply) {
-          const fullReply = `${aiReply}\n\n---\n*Was this helpful? You can reply with 'Yes' or 'No' to let me know.*`;
-          await editPost(thinkingPostId, fullReply);
-          const endTime = Date.now();
-          const durationInSeconds = (endTime - startTime) / 1000;
-          console.log(`✅ Edited post ${thinkingPostId} with final answer.`);
-          console.log(`⏱️ Total response time: ${durationInSeconds.toFixed(2)} seconds.`);
-          
-          awaitingFeedback.set(post.topic_id, { state: 'awaiting_initial_feedback' });
-          console.log(`💬 Awaiting feedback for topic ${post.topic_id}`);
-        }
-      }
+  for (const post of latest_posts) {
+    if (repliedPostIds.has(post.id) || post.username.toLowerCase() === config.discourse.apiUsername.toLowerCase() || post.username.toLowerCase().endsWith('bot')) {
+      continue;
     }
-  } catch (err) {
+    
     process.stdout.write('\n');
-    console.error('❌ Bot error:', err);
+    log(`📬 Found new post! ID: ${post.id}, User: ${post.username}.`);
+    
+    if (awaitingFeedback.has(post.topic_id)) {
+        await handleFeedbackReply(post);
+    } else {
+        await processPost(post);
+    }
   }
 }
 
-// --- Startup ---
 async function startup() {
-  await loadRepliedIds();
-  console.log('🚀 Bot started.');
-  setInterval(runBot, 3000);
-  runBot();
+  initializeDatabase();
+  repliedPostIds = loadIdsFromDb();
+  log('🚀 Bot started.');
+  log(`- Version: ${config.bot.version}`);
+ 
+  const poll = async () => {
+    try {
+      await runBot();
+    } catch (err) {
+      process.stdout.write('\n');
+      console.error(`[${config.bot.instanceId}] ❌ A critical error occurred in the main bot loop:`, err);
+    }
+    setTimeout(poll, 500);
+  };
+  poll();
 }
 
 startup();

@@ -1,119 +1,96 @@
 import axios from 'axios';
 import { htmlToText } from 'html-to-text';
-import OpenAI from 'openai';
-// regular functions (these exist at runtime)
-import { loadVectorStore, saveVectorStore } from './lib/vector-store.js';
-// The dotenv.config() line has been removed from here.
-const DISCOURSE_BASE_URL = process.env.DISCOURSE_BASE_URL;
-const DISCOURSE_API_KEY = process.env.DISCOURSE_API_KEY;
-const DISCOURSE_API_USERNAME = process.env.DISCOURSE_API_USERNAME;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const VECTOR_DB_PATH = process.env.VECTOR_DB_PATH || './data/vector_db.json';
-if (!DISCOURSE_BASE_URL || !DISCOURSE_API_KEY || !DISCOURSE_API_USERNAME) {
-    console.error('Missing Discourse API configuration. Please define DISCOURSE_BASE_URL, DISCOURSE_API_KEY and DISCOURSE_API_USERNAME in your environment.');
-    process.exit(1);
-}
-if (!OPENAI_API_KEY) {
-    console.error('Missing OpenAI API key. Please define OPENAI_API_KEY in your environment.');
-    process.exit(1);
-}
-// Initialize OpenAI API client
+import { OpenAI } from 'openai';
+import { connect } from '@lancedb/lancedb';
+import { config } from './config.js';
+// Initialize the OpenAI client using the central configuration.
 const openai = new OpenAI({
-    apiKey: OPENAI_API_KEY,
+    apiKey: config.openai.apiKey,
 });
 /**
- * Fetch the latest topics from the Discourse API.
- */
-async function fetchLatestTopics(page = 0) {
-    const url = `${DISCOURSE_BASE_URL}/latest.json${page > 0 ? `?page=${page}` : ''}`;
-    const res = await axios.get(url, {
-        headers: {
-            'Api-Key': DISCOURSE_API_KEY,
-            'Api-Username': DISCOURSE_API_USERNAME,
-        },
-    });
-    return res.data.topic_list.topics;
-}
-/**
- * Fetch the full contents of a single topic.
- * @param topicId Numeric ID of the topic
- */
-async function fetchTopicDetails(topicId) {
-    const url = `${DISCOURSE_BASE_URL}/t/${topicId}.json?print=true`;
-    const res = await axios.get(url, {
-        headers: {
-            'Api-Key': DISCOURSE_API_KEY,
-            'Api-Username': DISCOURSE_API_USERNAME,
-        },
-    });
-    return res.data;
-}
-/**
- * Ingests recent threads from the forum into the vector store.
- * @param limit Maximum number of topics to ingest per run
+ * Ingests recent threads from the Discourse forum into the LanceDB vector store.
+ * This script connects to the database, checks for new topics, creates vector embeddings,
+ * and adds the new documents to the 'discourse_threads' table.
+ * @param limit The maximum number of new topics to process in a single run.
  */
 export async function ingestThreads(limit = 20) {
-    const existingDocs = await loadVectorStore(VECTOR_DB_PATH);
-    const existingIds = new Set(existingDocs.map((doc) => doc.id));
-    let topics = [];
+    console.log('🚀 Starting ingestion process...');
+    // --- 1. Connect to Database & Open/Create Table ---
+    const db = await connect(config.paths.lanceDb);
+    let table;
     try {
-        topics = await fetchLatestTopics();
+        table = await db.openTable('discourse_threads');
+        console.log(`📚 Opened existing table "discourse_threads".`);
     }
-    catch (err) {
-        console.error('Error fetching latest topics:', err);
-        return;
+    catch (e) {
+        console.log('✨ Table "discourse_threads" not found, creating a new one...');
+        const sampleData = [{
+                id: '', title: '', url: '', content: '',
+                vector: Array(1536).fill(0), // OpenAI text-embedding-ada-002 uses 1536 dimensions
+            }];
+        table = await db.createTable('discourse_threads', sampleData);
+        await table.delete("id = ''"); // Clean up the placeholder record
+        console.log('✅ New table created successfully.');
     }
-    const newDocs = [...existingDocs];
+    // --- 2. Fetch Existing Document IDs for Duplicate Checking ---
+    console.log('🔍 Fetching existing document IDs to prevent duplicates...');
+    const allRecords = await table.query().select(['id']).toArray();
+    const existingIds = new Set(allRecords.map((doc) => doc.id));
+    console.log(`- Found ${existingIds.size} existing documents in the database.`);
+    // --- 3. Fetch Latest Topics from Discourse ---
+    const topics = await axios.get(`${config.discourse.baseUrl}/latest.json`, {
+        headers: { 'Api-Key': config.discourse.apiKey, 'Api-Username': config.discourse.apiUsername },
+    }).then(res => res.data.topic_list.topics);
+    console.log(`- Fetched ${topics.length} latest topics to check.`);
+    // --- 4. Process Each Topic and Prepare New Documents ---
+    const newDocs = [];
     let ingestedCount = 0;
     for (const topic of topics) {
-        if (ingestedCount >= limit)
+        if (ingestedCount >= limit) {
+            console.log(`- Reached ingestion limit of ${limit}. Stopping.`);
             break;
+        }
         const id = topic.id.toString();
         if (existingIds.has(id))
-            continue;
+            continue; // Skip if already in the database
         try {
-            const details = await fetchTopicDetails(topic.id);
+            console.log(`\nProcessing Topic ${id}: "${topic.title}"`);
+            const details = await axios.get(`${config.discourse.baseUrl}/t/${topic.id}.json`, {
+                headers: { 'Api-Key': config.discourse.apiKey, 'Api-Username': config.discourse.apiUsername },
+            }).then(res => res.data);
             const posts = details.post_stream?.posts || [];
             const combinedHtml = posts.map((p) => p.cooked).join('\n\n');
-            const content = htmlToText(combinedHtml, {
-                wordwrap: false,
-                selectors: [{ selector: 'a', format: 'skip' }],
-            });
-            if (!content || content.trim().length === 0) {
-                console.warn(`⚠ Skipping topic ${topic.id} — empty content`);
-                continue;
-            }
-            if (content.length > 8000) {
-                console.warn(`⚠ Skipping topic ${topic.id} — content too long (${content.length} chars)`);
+            const content = htmlToText(combinedHtml, { wordwrap: false, selectors: [{ selector: 'a', format: 'skip' }] });
+            if (!content || content.trim().length < 50) {
+                console.warn(`- ⚠️ Skipping topic ${topic.id} due to short content.`);
                 continue;
             }
             const input = content.slice(0, 8192);
-            const embRes = await openai.embeddings.create({
-                model: "text-embedding-ada-002",
-                input,
-            });
-            if (!embRes.data || !embRes.data[0] || !embRes.data[0].embedding) {
-                console.error(`❌ No embedding returned for topic ${id}`);
-                continue;
-            }
+            const embRes = await openai.embeddings.create({ model: "text-embedding-ada-002", input });
             const embedding = embRes.data[0].embedding;
-            const slug = details.slug || topic.slug || '';
-            const url = `${DISCOURSE_BASE_URL}/t/${slug}/${details.id}`;
-            newDocs.push({ id, title: details.title, url, content, embedding });
+            const url = `${config.discourse.baseUrl}/t/${details.slug || topic.slug}/${details.id}`;
+            newDocs.push({ id, title: details.title, url, content, vector: embedding });
             ingestedCount++;
-            console.log(`Ingested topic ${id}: ${details.title}`);
+            console.log(`- ✅ Prepared topic ${id} for ingestion.`);
         }
         catch (err) {
-            console.error(`Failed to ingest topic ${topic.id}`, err);
+            console.error(`- ❌ Failed to process topic ${id}:`, err.message || err);
         }
     }
-    await saveVectorStore(VECTOR_DB_PATH, newDocs);
-    console.log(`Ingestion complete. Vector DB now contains ${newDocs.length} documents.`);
+    // --- 5. Add New Documents to the Database ---
+    if (newDocs.length > 0) {
+        console.log(`\n➕ Adding ${newDocs.length} new documents to the database...`);
+        await table.add(newDocs);
+        console.log('✅ Successfully added documents.');
+    }
+    else {
+        console.log('\n✨ No new documents to add.');
+    }
+    const finalCount = await table.countRows();
+    console.log(`🏁 Ingestion complete. Vector DB now contains ${finalCount} total documents.`);
 }
-// Only run if called directly
-if (process.argv[1]?.endsWith('thread-ingestor.ts')) {
-    ingestThreads().catch((err) => {
-        console.error(err);
-        process.exit(1);
-    });
-}
+// This allows the script to be run directly via "npm run ingest"
+ingestThreads().catch((err) => {
+    console.error("An unexpected error occurred during the ingestion process:", err);
+    process.exit(1);
+});
