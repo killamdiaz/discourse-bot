@@ -1,12 +1,12 @@
 import { connect } from '@lancedb/lancedb';
 import { OpenAI } from 'openai';
 import { config } from '../config.js';
-// Initialize the OpenAI client using the central configuration.
+// using openai to center the basic model
 const openai = new OpenAI({
     apiKey: config.openai.apiKey,
 });
 /**
- * A high-performance vector store that connects to LanceDB to perform similarity searches.
+    LanceDB initialization for high dimentional vector db
  */
 export const vectorStore = {
     /**
@@ -16,7 +16,7 @@ export const vectorStore = {
      * @returns A promise that resolves to an array of the top k search results.
      */
     similaritySearch: async (query, k = 3) => {
-        // Don't waste API calls on empty queries.
+        // smart bano chodu nahi...
         if (!query || query.trim() === '') {
             console.warn('⚠️ Similarity search called with an empty query.');
             return [];
@@ -32,7 +32,6 @@ export const vectorStore = {
             });
             const queryEmbedding = embRes.data[0].embedding;
             // 3. Perform the similarity search directly in LanceDB.
-            // This is extremely fast as it uses the database's native vector index.
             const results = await table
                 .search(queryEmbedding)
                 .limit(k)
@@ -44,7 +43,6 @@ export const vectorStore = {
             }));
         }
         catch (error) {
-            // Provide helpful error messages if something goes wrong.
             if (error.message.includes('Table discourse_threads not found')) {
                 console.warn('⚠️ Vector DB table not found. Please run the ingestor script first (`npm run ingest`).');
             }

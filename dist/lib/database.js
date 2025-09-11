@@ -1,11 +1,11 @@
 import Database from 'better-sqlite3';
 import { config } from '../config.js';
-// The path to our new SQLite database file.
+// SQLite file
 const dbPath = './data/bot_state.db';
 let db;
 /**
- * Initializes the database connection and creates tables if they don't exist.
- * This should be called once when the bot starts up.
+    Initializes the database connection and creates tables if they don't exist.
+    This should be called once when the bot starts up.
  */
 export function initializeDatabase() {
     db = new Database(dbPath);
@@ -35,7 +35,6 @@ export function loadRepliedIds() {
  * @param postId The ID of the post to add.
  */
 export function addRepliedId(postId) {
-    // 'INSERT OR IGNORE' ensures that if the ID already exists, it doesn't cause an error.
     const stmt = db.prepare('INSERT OR IGNORE INTO replied_posts (id) VALUES (?)');
     stmt.run(postId);
 }

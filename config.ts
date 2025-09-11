@@ -25,49 +25,24 @@ export const config = {
     repliedPostsDb: './data/bot_state.db',
   },
 
+  // --- Bot Behavior Settings ---
   bot: {
     instanceId: Math.random().toString(36).substring(2, 8),
-    version: '3.5 hybrid powered by AgentBrain',
+    version: '4.O hybrid powered by AgentBrain',
     thinkingMessages: [
       '_Thinking..._',
       '_Processing your request..._',
       '_One moment, looking that up..._',
       '_Compiling an answer..._'
     ],
+    polling_interval_seconds: 5,
+    support_email: "your-support-team-email@example.com",
+    max_reply_tokens: 300,
+    max_intent_tokens: 10
   },
-  prompts: {
-    /**
-     "Agent Brain" to classify the user's intent
-    */
-
-    intentClassification: (postContent: string) => `
-      Analyze the following forum post and classify its primary intent.
-      IMPORTANT: If the user asks a question, the intent is ALWAYS "question", even if they also say "thanks".
-
-      Choose one of the following categories:
-      - "question": The user is asking for help, information, or how to do something. This is the highest priority intent.
-      - "bug_report": The user is reporting an error, a crash, or something not working as expected.
-      - "escalation_request": The user is explicitly asking for a human, a support agent, or to create a ticket.
-      - "positive_feedback": The user is ONLY saying thank you or expressing satisfaction, with no follow-up question.
-      - "other": The post is a general comment or does not fit the other categories.
-
-      Post: "${postContent}"
-      
-      Intent:`,
-
-    /**
-        main system prompt
-     */
-    mainSystem: (topicTitle: string, knowledgeBaseContext: string) => `
-      You are an expert AI assistant for the community forum topic "${topicTitle}".
-      Your primary purpose is to answer the user's most recent post directly and accurately.
-
-      **Instructions:**
-      1. Prioritize using information from the **KNOWLEDGE BASE** provided below. It is the most trustworthy source.
-      2. Analyze the recent conversation history for context, but focus on answering the latest post.
-      3. Be concise and clear. Do not repeat the user's question.
-      
-      --- KNOWLEDGE BASE ---
-      ${knowledgeBaseContext}`
-  }
+  labels: {
+    replied: "Bot: Replied",
+    escalated: "Bot: Escalated",
+    ignored: "Bot: Ignored"
+  },
 };
