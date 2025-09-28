@@ -1,23 +1,18 @@
-// config.ts
 export const config = {
-    // --- Discourse API Configuration ---
     discourse: {
         baseUrl: process.env.DISCOURSE_BASE_URL,
         apiKey: process.env.DISCOURSE_API_KEY,
         apiUsername: process.env.DISCOURSE_API_USERNAME || 'system',
         supportGroupName: process.env.SUPPORT_GROUP_NAME || 'support_team',
     },
-    // --- OpenAI API Configuration ---
     openai: {
         apiKey: process.env.OPENAI_API_KEY,
         model: 'gpt-4o',
     },
-    // --- Database and State Paths ---
     paths: {
         lanceDb: process.env.LANCE_DB_PATH || './data/lancedb',
         repliedPostsDb: './data/bot_state.db',
     },
-    // --- Discord Configuration ---
     discord: {
         token: process.env.DISCORD_BOT_TOKEN,
         clientId: process.env.DISCORD_CLIENT_ID,
@@ -26,7 +21,6 @@ export const config = {
         supportRoleId: process.env.DISCORD_SUPPORT_ROLE_ID,
         forumChannelId: process.env.DISCORD_FORUM_CHANNEL_ID,
     },
-    // --- Bot Behavior Settings ---
     bot: {
         instanceId: Math.random().toString(36).substring(2, 8),
         version: '4.O hybrid powered by AgentBrain',

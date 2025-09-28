@@ -9,21 +9,23 @@ import {
   GuildMember,
 } from 'discord.js';
 import { OpenAI } from 'openai';
-import { vectorStore } from './lib/vector-store.js'; //
-import { config } from './config.js'; //
-import { prompts } from './prompts.js'; //
+import { vectorStore } from './lib/vector-store.js';
+import { config } from './config.js';
+import { prompts } from './prompts.js';
 
-const openai = new OpenAI({ apiKey: config.openai.apiKey }); //
+const openai = new OpenAI({ apiKey: config.openai.apiKey });
 
 type UserIntent = 'question' | 'escalation_request' | 'follow_up' | 'other';
 
+const DEFAULT_ERROR_MESSAGE = "I'm sorry, I encountered a technical issue and couldn't process your request. A human agent has been notified.";
+
 async function determineUserIntent(postContent: string): Promise<UserIntent> {
-    const prompt = prompts.intent_classifier(postContent); //
+    const prompt = prompts.intent_classifier(postContent);
     try {
         const completion = await openai.chat.completions.create({
-            model: config.openai.model, //
+            model: config.openai.model,
             messages: [{ role: 'user', content: prompt }],
-            max_tokens: config.bot.max_intent_tokens, //
+            max_tokens: config.bot.max_intent_tokens,
             temperature: 0,
         });
         const rawIntent = completion.choices[0].message.content?.trim().toLowerCase() || 'other';
@@ -39,16 +41,48 @@ async function determineUserIntent(postContent: string): Promise<UserIntent> {
 
 async function generateAiReply(topicTitle: string, conversation_history: OpenAI.Chat.ChatCompletionMessageParam[]): Promise<string> {
     const lastUserMessage = conversation_history[conversation_history.length - 1].content as string;
-    const similarDocs = await vectorStore.similaritySearch(lastUserMessage, 3); //
-    const context = similarDocs.map(doc => doc.pageContent).join('\n---\n'); //
-    const system_prompt = prompts.ai_reply_system(topicTitle, context); //
+    
+    const similarDocs = await vectorStore.similaritySearch(lastUserMessage, 5);
+
+    if (similarDocs.length === 0) {
+        return "I'm sorry, I couldn't find any relevant information in my knowledge base to answer your question. If you'd like, I can escalate this to a human agent.";
+    }
+
+    const formattedContext = similarDocs
+        .map((doc, index) => `[Source ${index + 1}: ${doc.title}]\n${doc.content}`)
+        .join('\n\n---\n\n');
+
+    const system_prompt = prompts.ai_reply_system(topicTitle, formattedContext);
     const messages_for_api: OpenAI.Chat.ChatCompletionMessageParam[] = [{ role: 'system', content: system_prompt }, ...conversation_history];
+    
     try {
-        const response = await openai.chat.completions.create({ model: config.openai.model, messages: messages_for_api, max_tokens: config.bot.max_reply_tokens }); //
-        return response.choices[0].message.content?.trim() ?? "I'm sorry, I encountered an error.";
+        const response = await openai.chat.completions.create({ model: config.openai.model, messages: messages_for_api, max_tokens: config.bot.max_reply_tokens });
+        const aiResponse = response.choices[0].message.content;
+
+        // --- ROBUSTNESS FIX ---
+        if (!aiResponse || aiResponse.trim() === '') {
+            console.error("OpenAI returned an empty or null response.");
+            return DEFAULT_ERROR_MESSAGE;
+        }
+
+        const sources = similarDocs.map((doc, index) => {
+            if (aiResponse.includes(`[${index + 1}]`)) {
+                const link = doc.url.startsWith('http') ? `[${doc.title}](${doc.url})` : doc.title;
+                return `${index + 1}. ${link}`;
+            }
+            return null;
+        }).filter(Boolean);
+
+        let finalReply = aiResponse;
+        if (sources.length > 0) {
+            finalReply = `${aiResponse}\n\n**Sources:**\n${sources.join('\n')}`;
+        }
+        
+        return finalReply.trim() === '' ? DEFAULT_ERROR_MESSAGE : finalReply;
+
     } catch (e) {
         console.error("Error generating AI reply:", e);
-        return "I'm sorry, I encountered an error. A human agent will get back to you shortly.";
+        return DEFAULT_ERROR_MESSAGE;
     }
 }
 
@@ -56,6 +90,7 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBit
 
 client.once(Events.ClientReady, c => { console.log(`🚀 Discord Bot is ready! Logged in as ${c.user.tag}`); });
 
+// --- All event listeners remain the same ---
 client.on(Events.InteractionCreate, async interaction => {
     if (interaction.isButton() && interaction.customId === 'create_ticket_button') {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
@@ -74,7 +109,6 @@ client.on(Events.InteractionCreate, async interaction => {
         }
         return;
     }
-
     if (interaction.isChatInputCommand() && interaction.commandName === 'close') {
         if (!interaction.channel?.isThread()) {
             await interaction.reply({ content: 'This command can only be used inside a ticket thread.', flags: MessageFlags.Ephemeral });
@@ -94,9 +128,8 @@ client.on(Events.InteractionCreate, async interaction => {
         await interaction.channel.setArchived(true);
     }
 });
-
 client.on(Events.MessageCreate, async message => {
-    if (message.author.bot || !message.guild || !message.channel.isThread() || message.channel.parentId !== config.discord.ticketChannelId) return; //
+    if (message.author.bot || !message.guild || !message.channel.isThread() || message.channel.parentId !== config.discord.ticketChannelId) return;
     const intent = await determineUserIntent(message.content);
     console.log(`📬 Message in private ticket ${message.channel.name}. Intent: ${intent}`);
     switch (intent) {
@@ -108,25 +141,23 @@ client.on(Events.MessageCreate, async message => {
             await message.channel.send(reply_text);
             break;
         case 'escalation_request':
-            await message.reply(`I understand. I've notified the support team (<@&${config.discord.supportRoleId}>) to look into this ticket personally.`); //
+            await message.reply(`I understand. I've notified the support team (<@&${config.discord.supportRoleId}>) to look into this ticket personally.`);
             break;
         case 'follow_up':
         case 'other':
             const lastMessages = await message.channel.messages.fetch({ limit: 1, before: message.id });
             const lastMessage = lastMessages.first();
-            if (lastMessage && lastMessage.author.id === client.user?.id && lastMessage.content.includes('escalate your request')) {
+            if (lastMessage && lastMessage.author.id === client.user?.id && lastMessage.content.includes('escalate')) {
                 console.log(`- User confirmed escalation for ticket ${message.channel.name}.`);
-                await message.reply(`Understood. I have notified the support team (<@&${config.discord.supportRoleId}>) for you.`); //
+                await message.reply(`Understood. I have notified the support team (<@&${config.discord.supportRoleId}>) for you.`);
             } else {
                 console.log(`- Ignoring message with intent '${intent}'.`);
             }
             break;
     }
 });
-
 client.on(Events.ThreadCreate, async (thread) => {
-    if (thread.parentId !== config.discord.forumChannelId) return; //
-
+    if (thread.parentId !== config.discord.forumChannelId) return;
     console.log(`📬 New post created in community support forum: "${thread.name}"`);
     try {
         const starterMessage = await thread.fetchStarterMessage();
@@ -142,11 +173,12 @@ client.on(Events.ThreadCreate, async (thread) => {
             const reply_text = await generateAiReply(thread.name, conversation_history);
             await thread.send(reply_text);
         } else {
-            await thread.send(`I've noted your post. A member of the <@&${config.discord.supportRoleId}> will see it shortly.`); //
+            await thread.send(`I've noted your post. A member of the <@&${config.discord.supportRoleId}> will see it shortly.`);
         }
     } catch (error) {
         console.error(`- Error processing forum post ${thread.id}:`, error);
     }
 });
 
-client.login(config.discord.token); //
+client.login(config.discord.token);
+
