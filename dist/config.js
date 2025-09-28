@@ -1,8 +1,4 @@
 // config.ts
-/**
- * This file contains the central configuration for the Discourse bot.
- * It pulls sensitive data from environment variables and sets up application-wide settings.
- */
 export const config = {
     // --- Discourse API Configuration ---
     discourse: {
@@ -21,24 +17,24 @@ export const config = {
         lanceDb: process.env.LANCE_DB_PATH || './data/lancedb',
         repliedPostsDb: './data/bot_state.db',
     },
+    // --- Discord Configuration ---
+    discord: {
+        token: process.env.DISCORD_BOT_TOKEN,
+        clientId: process.env.DISCORD_CLIENT_ID,
+        guildId: process.env.DISCORD_GUILD_ID,
+        ticketChannelId: process.env.DISCORD_TICKET_CHANNEL_ID,
+        supportRoleId: process.env.DISCORD_SUPPORT_ROLE_ID,
+        forumChannelId: process.env.DISCORD_FORUM_CHANNEL_ID,
+    },
     // --- Bot Behavior Settings ---
     bot: {
         instanceId: Math.random().toString(36).substring(2, 8),
         version: '4.O hybrid powered by AgentBrain',
-        thinkingMessages: [
-            '_Thinking..._',
-            '_Processing your request..._',
-            '_One moment, looking that up..._',
-            '_Compiling an answer..._'
-        ],
+        thinkingMessages: [ /* ... */],
         polling_interval_seconds: 5,
         support_email: "your-support-team-email@example.com",
         max_reply_tokens: 300,
         max_intent_tokens: 10
     },
-    labels: {
-        replied: "Bot: Replied",
-        escalated: "Bot: Escalated",
-        ignored: "Bot: Ignored"
-    },
+    labels: { /* ... */},
 };
