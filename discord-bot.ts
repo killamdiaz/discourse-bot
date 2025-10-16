@@ -129,7 +129,7 @@ client.on(Events.InteractionCreate, async interaction => {
     }
 });
 client.on(Events.MessageCreate, async message => {
-    if (message.author.bot || !message.guild || !message.channel.isThread() || message.channel.parentId !== config.discord.ticketChannelId) return;
+    if (message.author.bot || !message.guild || !message.channel.isThread() || (message.channel.parentId !== config.discord.ticketChannelId && message.channel.parentId !== config.discord.forumChannelId)) return;
     const intent = await determineUserIntent(message.content);
     console.log(`📬 Message in private ticket ${message.channel.name}. Intent: ${intent}`);
     switch (intent) {
@@ -181,4 +181,3 @@ client.on(Events.ThreadCreate, async (thread) => {
 });
 
 client.login(config.discord.token);
-
